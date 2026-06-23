@@ -52,16 +52,37 @@ export class ClaudeWorker extends EventEmitter {
     }
 
     // Note: We use --output-format json (not stream-json) for simpler parsing
-    // The prompt is passed as a command-line argument
+    //
+    // Security: tool access and permission bypass are OPT-IN, not the default.
+    //   CLAUDE_TOOLS  -> value passed to `--tools` ("" disables ALL tools, the
+    //                    safe default; "default" enables all; or a list like
+    //                    "Read,Edit"). With tools disabled the worker can only
+    //                    generate text, removing the RCE surface for an exposed
+    //                    HTTP endpoint.
+    //   CLAUDE_SKIP_PERMISSIONS=true -> restores the old
+    //                    `--dangerously-skip-permissions` behaviour. Only
+    //                    meaningful when tools are enabled. Never enable this on
+    //                    an endpoint reachable by untrusted clients.
+    //
+    // NOTE: `--tools` is variadic, so it must be followed by another flag and
+    // never sit immediately before the prompt, or it swallows the prompt as a
+    // tool name. The prompt is always passed LAST as the lone positional arg.
+    const toolsSetting = process.env.CLAUDE_TOOLS ?? ''
+    const skipPermissions = process.env.CLAUDE_SKIP_PERMISSIONS === 'true'
+
     const args = [
       '-p',
+      '--tools',
+      toolsSetting,
       '--output-format',
       'json',
       '--session-id',
-      this.conversationId,
-      '--dangerously-skip-permissions',
-      prompt // Add prompt as final argument
+      this.conversationId
     ]
+    if (skipPermissions) {
+      args.push('--dangerously-skip-permissions')
+    }
+    args.push(prompt) // prompt MUST be the final argument
 
     // Use OAuth mode (global claude) or API key mode (local installation)
     const command = USE_OAUTH

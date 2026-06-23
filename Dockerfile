@@ -34,18 +34,22 @@ RUN npm install
 # Copy application code
 COPY . .
 
-# Create workspace directory
-RUN mkdir -p /workspace
-
-# Create claude config directory
-RUN mkdir -p /root/.claude
+# Create workspace + Claude config dirs owned by the non-root `node` user
+# (uid 1000, shipped with the official node image). In oauth mode the
+# subscription credentials are read from $HOME/.claude.
+RUN mkdir -p /workspace /home/node/.claude \
+    && chown -R node:node /app /workspace /home/node/.claude
 
 # Environment variables with defaults
 ENV NODE_ENV=production
+ENV HOME=/home/node
 ENV PORT=3000
 ENV POOL_SIZE=5
 ENV IDLE_TIMEOUT_MS=300000
 ENV WORKSPACE_DIR=/workspace
+
+# Drop privileges: never run the worker pool as root
+USER node
 
 # Expose API port
 EXPOSE 3000

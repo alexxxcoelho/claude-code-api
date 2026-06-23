@@ -1,12 +1,62 @@
 import 'dotenv/config'
 import express from 'express'
 import cors from 'cors'
+import { timingSafeEqual } from 'crypto'
 import { v4 as uuidv4 } from 'uuid'
 import { HybridPool } from './pool.js'
 
 const app = express()
 app.use(cors()) // Enable CORS for all routes
 app.use(express.json({ limit: '10mb' }))
+
+/**
+ * Optional API-key authentication.
+ *
+ * If PROXY_API_KEY is set, every request (except /health) must present it as
+ * either `Authorization: Bearer <key>` or `x-api-key: <key>`. This protects the
+ * endpoint — which can spawn Claude Code workers and consume your subscription
+ * quota — from untrusted callers when exposed beyond localhost.
+ *
+ * If PROXY_API_KEY is NOT set, the API stays open (backwards compatible) but a
+ * loud warning is logged, because an unauthenticated, internet-reachable
+ * instance lets anyone burn your quota.
+ */
+const PROXY_API_KEY = process.env.PROXY_API_KEY
+
+if (!PROXY_API_KEY) {
+  console.warn(
+    '[Security] PROXY_API_KEY is not set — the API is UNAUTHENTICATED. ' +
+      'Anyone who can reach this port can use your Claude subscription. ' +
+      'Set PROXY_API_KEY to require a Bearer token.'
+  )
+}
+
+function safeEqual (a, b) {
+  const ba = Buffer.from(String(a))
+  const bb = Buffer.from(String(b))
+  if (ba.length !== bb.length) return false
+  return timingSafeEqual(ba, bb)
+}
+
+app.use((req, res, next) => {
+  if (req.path === '/health') return next()
+  if (!PROXY_API_KEY) return next()
+
+  const authHeader = req.headers['authorization'] || ''
+  const presented = authHeader.startsWith('Bearer ')
+    ? authHeader.slice(7)
+    : req.headers['x-api-key'] || ''
+
+  if (presented && safeEqual(presented, PROXY_API_KEY)) return next()
+
+  return res.status(401).json({
+    error: {
+      message: 'Invalid or missing API key',
+      type: 'authentication_error',
+      code: 'invalid_api_key'
+    }
+  })
+})
 
 // Initialize the hybrid pool
 const pool = new HybridPool()
