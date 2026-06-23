@@ -7,7 +7,16 @@ services:
     ports:
       - "3000:3000"
     environment:
+      # Auth: oauth (subscription) mode + token from `npm run login`
+      - AUTH_MODE=${AUTH_MODE:-oauth}
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      # API-key mode alternative (only used when AUTH_MODE is unset)
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # Client auth + tool/model policy
+      - PROXY_API_KEY=${PROXY_API_KEY}
+      - CLAUDE_TOOLS=${CLAUDE_TOOLS-}
+      - CLAUDE_SKIP_PERMISSIONS=${CLAUDE_SKIP_PERMISSIONS:-false}
+      - MODEL_ALIASES=${MODEL_ALIASES-}
       - POOL_SIZE=${POOL_SIZE:-5}
       - IDLE_TIMEOUT_MS=${IDLE_TIMEOUT_MS:-300000}
       - PORT=3000
@@ -15,8 +24,8 @@ services:
     volumes:
       # Mount your project files here
       - ./workspace:/workspace
-      # Persist Claude sessions across container restarts
-      - claude-sessions:/root/.claude
+      # Persist Claude sessions across container restarts (non-root `node` user)
+      - claude-sessions:/home/node/.claude
     restart: unless-stopped
     # Resource limits (adjust as needed)
     deploy:
