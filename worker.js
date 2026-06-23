@@ -26,6 +26,29 @@ const CLAUDE_CLI_PATH = join(
 // Check if OAuth mode is enabled
 const USE_OAUTH = process.env.AUTH_MODE === 'oauth'
 
+// Optional model alias map (JSON). Maps the model id a client sends to the value
+// passed to `claude --model`, e.g.
+//   MODEL_ALIASES='{"anthropic-sonnet-4-6":"claude-sonnet-4-6","gpt-4o":"opus"}'
+// Unmapped models are passed through as-is (so "sonnet", "opus", "haiku" or a
+// full "claude-..." id work directly). The sentinel "claude-code" and an empty
+// model fall back to the CLI's default model.
+let MODEL_ALIASES = {}
+try {
+  if (process.env.MODEL_ALIASES) {
+    MODEL_ALIASES = JSON.parse(process.env.MODEL_ALIASES)
+  }
+} catch (err) {
+  console.error('[Worker] Invalid MODEL_ALIASES JSON, ignoring:', err.message)
+}
+
+export function resolveModel (model) {
+  if (!model) return null
+  // Strip the optional ":<conversationId>" routing suffix.
+  const base = String(model).split(':')[0].trim()
+  if (!base || base === 'claude-code') return null // use the CLI default model
+  return MODEL_ALIASES[base] || base
+}
+
 /**
  * Manages a single Claude Code CLI process
  */
@@ -45,7 +68,7 @@ export class ClaudeWorker extends EventEmitter {
    * Spawn the Claude Code CLI process
    * Note: We spawn a new process for each request in non-streaming mode
    */
-  async spawn (prompt) {
+  async spawn (prompt, model) {
     if (this.proc && this.proc.exitCode === null) {
       // Kill existing process if still running
       this.proc.kill()
@@ -79,6 +102,10 @@ export class ClaudeWorker extends EventEmitter {
       '--session-id',
       this.conversationId
     ]
+    const resolvedModel = resolveModel(model)
+    if (resolvedModel) {
+      args.push('--model', resolvedModel)
+    }
     if (skipPermissions) {
       args.push('--dangerously-skip-permissions')
     }
@@ -285,8 +312,8 @@ export class ClaudeWorker extends EventEmitter {
         resultEvent: null
       })
 
-      // Spawn new process with the prompt
-      this.spawn(prompt).catch(reject)
+      // Spawn new process with the prompt + requested model
+      this.spawn(prompt, model).catch(reject)
     })
   }
 

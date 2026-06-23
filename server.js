@@ -86,22 +86,32 @@ app.get('/health', (req, res) => {
 })
 
 /**
- * List available models
+ * List available models: the "claude-code" sentinel (CLI default model) plus
+ * any client-facing ids declared in MODEL_ALIASES.
  */
+let MODEL_ALIAS_IDS = []
+try {
+  if (process.env.MODEL_ALIASES) {
+    MODEL_ALIAS_IDS = Object.keys(JSON.parse(process.env.MODEL_ALIASES))
+  }
+} catch (err) {
+  console.error('[API] Invalid MODEL_ALIASES JSON, ignoring:', err.message)
+}
+
 app.get('/v1/models', (req, res) => {
+  const created = Math.floor(Date.now() / 1000)
+  const ids = ['claude-code', ...MODEL_ALIAS_IDS]
   res.json({
     object: 'list',
-    data: [
-      {
-        id: 'claude-code',
-        object: 'model',
-        created: Math.floor(Date.now() / 1000),
-        owned_by: 'anthropic',
-        permission: [],
-        root: 'claude-code',
-        parent: null
-      }
-    ]
+    data: ids.map(id => ({
+      id,
+      object: 'model',
+      created,
+      owned_by: 'anthropic',
+      permission: [],
+      root: id,
+      parent: null
+    }))
   })
 })
 
