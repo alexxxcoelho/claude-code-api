@@ -49,6 +49,57 @@ export function resolveModel (model) {
   return MODEL_ALIASES[base] || base
 }
 
+// Optional default system prompt used when the client doesn't send a system
+// message. Overriding the system prompt (below) strips Claude Code's coding-agent
+// framing so the proxy behaves like a plain chat model.
+const DEFAULT_SYSTEM_PROMPT =
+  process.env.CLAUDE_SYSTEM_PROMPT || 'You are a helpful assistant.'
+
+/**
+ * Extract plain text from an OpenAI `content` field, which may be a string or an
+ * array of parts (e.g. [{type:'text',text:'...'}]). Without this, an array
+ * content is coerced to "[object Object]" and reaches the model as garbage.
+ */
+export function extractText (content) {
+  if (content == null) return ''
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    return content
+      .map(part =>
+        typeof part === 'string' ? part : part?.text ?? part?.content ?? ''
+      )
+      .filter(Boolean)
+      .join('')
+  }
+  return String(content)
+}
+
+/**
+ * Turn OpenAI chat messages into { systemPrompt, prompt }.
+ * - system messages become the overridden system prompt (chat behaviour).
+ * - a single user turn becomes the prompt verbatim; multi-turn conversations are
+ *   rendered as a Human/Assistant transcript so prior context is preserved even
+ *   when the client doesn't reuse a conversation id.
+ */
+export function messagesToPrompt (messages) {
+  const systemPrompt = messages
+    .filter(m => m.role === 'system')
+    .map(m => extractText(m.content))
+    .filter(Boolean)
+    .join('\n\n')
+
+  const convo = messages.filter(m => m.role === 'user' || m.role === 'assistant')
+  let prompt
+  if (convo.length <= 1) {
+    prompt = convo.length ? extractText(convo[0].content) : ''
+  } else {
+    prompt = convo
+      .map(m => `${m.role === 'assistant' ? 'Assistant' : 'Human'}: ${extractText(m.content)}`)
+      .join('\n\n')
+  }
+  return { systemPrompt, prompt }
+}
+
 /**
  * Manages a single Claude Code CLI process
  */
@@ -79,11 +130,19 @@ export class ClaudeWorker extends EventEmitter {
    * never sits immediately before the prompt, which would otherwise be swallowed
    * as a tool name. The prompt is always the final positional argument.
    */
-  buildClaudeArgs (prompt, model, { stream = false } = {}) {
+  buildClaudeArgs (prompt, model, { stream = false, systemPrompt = '' } = {}) {
     const toolsSetting = process.env.CLAUDE_TOOLS ?? ''
     const skipPermissions = process.env.CLAUDE_SKIP_PERMISSIONS === 'true'
 
     const args = ['-p', '--tools', toolsSetting]
+    // Override the system prompt so the proxy behaves as a chat model rather
+    // than the Claude Code coding agent, and drop the dynamic env/skills/memory
+    // sections. Client system message wins; otherwise a neutral default.
+    args.push(
+      '--system-prompt',
+      systemPrompt || DEFAULT_SYSTEM_PROMPT,
+      '--exclude-dynamic-system-prompt-sections'
+    )
     if (stream) {
       // Realtime token deltas as NDJSON; --verbose is required with -p.
       args.push(
@@ -126,14 +185,14 @@ export class ClaudeWorker extends EventEmitter {
    * Spawn the Claude Code CLI process
    * Note: We spawn a new process for each request in non-streaming mode
    */
-  async spawn (prompt, model) {
+  async spawn (prompt, model, systemPrompt) {
     if (this.proc && this.proc.exitCode === null) {
       // Kill existing process if still running
       this.proc.kill()
     }
 
     // Non-streaming: one JSON object on stdout (parsed in handleJsonOutput).
-    const args = this.buildClaudeArgs(prompt, model, { stream: false })
+    const args = this.buildClaudeArgs(prompt, model, { stream: false, systemPrompt })
     const { command, finalArgs } = this.resolveSpawnCommand(args)
 
     console.log(
@@ -307,18 +366,7 @@ export class ClaudeWorker extends EventEmitter {
   async send (messages, model = 'claude-code') {
     this.lastUsed = Date.now()
 
-    // Build prompt from messages
-    let prompt = ''
-    for (const msg of messages) {
-      if (msg.role === 'system') {
-        prompt += `System: ${msg.content}\n\n`
-      } else if (msg.role === 'user') {
-        prompt += msg.content
-      } else if (msg.role === 'assistant') {
-        // Skip assistant messages - Claude maintains history via session
-      }
-    }
-
+    const { systemPrompt, prompt } = messagesToPrompt(messages)
     const requestId = uuidv4()
 
     return new Promise((resolve, reject) => {
@@ -329,8 +377,8 @@ export class ClaudeWorker extends EventEmitter {
         resultEvent: null
       })
 
-      // Spawn new process with the prompt + requested model
-      this.spawn(prompt, model).catch(reject)
+      // Spawn new process with the prompt + requested model + system prompt
+      this.spawn(prompt, model, systemPrompt).catch(reject)
     })
   }
 
@@ -345,18 +393,9 @@ export class ClaudeWorker extends EventEmitter {
   async sendStreaming (messages, model, onChunk) {
     this.lastUsed = Date.now()
 
-    // Build prompt from messages (same convention as send())
-    let prompt = ''
-    for (const msg of messages) {
-      if (msg.role === 'system') {
-        prompt += `System: ${msg.content}\n\n`
-      } else if (msg.role === 'user') {
-        prompt += msg.content
-      }
-    }
-
+    const { systemPrompt, prompt } = messagesToPrompt(messages)
     const completionId = `chatcmpl-${uuidv4().slice(0, 8)}`
-    const args = this.buildClaudeArgs(prompt, model, { stream: true })
+    const args = this.buildClaudeArgs(prompt, model, { stream: true, systemPrompt })
     const { command, finalArgs } = this.resolveSpawnCommand(args)
 
     console.log(
