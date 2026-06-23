@@ -65,6 +65,64 @@ export class ClaudeWorker extends EventEmitter {
   }
 
   /**
+   * Build the `claude` argument list shared by streaming and non-streaming.
+   *
+   * Security: tool access and permission bypass are OPT-IN, not the default.
+   *   CLAUDE_TOOLS  -> value passed to `--tools` ("" disables ALL tools, the
+   *                    safe default; "default" enables all; or a list like
+   *                    "Read,Edit"). With tools disabled the worker can only
+   *                    generate text, removing the RCE surface for an exposed
+   *                    HTTP endpoint.
+   *   CLAUDE_SKIP_PERMISSIONS=true -> restores --dangerously-skip-permissions.
+   *
+   * NOTE: `--tools` is variadic, so it is always followed by another flag and
+   * never sits immediately before the prompt, which would otherwise be swallowed
+   * as a tool name. The prompt is always the final positional argument.
+   */
+  buildClaudeArgs (prompt, model, { stream = false } = {}) {
+    const toolsSetting = process.env.CLAUDE_TOOLS ?? ''
+    const skipPermissions = process.env.CLAUDE_SKIP_PERMISSIONS === 'true'
+
+    const args = ['-p', '--tools', toolsSetting]
+    if (stream) {
+      // Realtime token deltas as NDJSON; --verbose is required with -p.
+      args.push(
+        '--output-format',
+        'stream-json',
+        '--verbose',
+        '--include-partial-messages'
+      )
+    } else {
+      args.push('--output-format', 'json')
+    }
+    args.push('--session-id', this.conversationId)
+
+    const resolvedModel = resolveModel(model)
+    if (resolvedModel) {
+      args.push('--model', resolvedModel)
+    }
+    if (skipPermissions) {
+      args.push('--dangerously-skip-permissions')
+    }
+    args.push(prompt) // prompt MUST be the final argument
+    return args
+  }
+
+  /**
+   * Resolve the command + args for the current auth mode: the global `claude`
+   * binary in oauth mode, or the bundled CLI run via node in API-key mode.
+   */
+  resolveSpawnCommand (args) {
+    const command = USE_OAUTH
+      ? process.platform === 'win32'
+        ? 'claude.cmd'
+        : 'claude'
+      : 'node'
+    const finalArgs = USE_OAUTH ? args : [CLAUDE_CLI_PATH, ...args]
+    return { command, finalArgs }
+  }
+
+  /**
    * Spawn the Claude Code CLI process
    * Note: We spawn a new process for each request in non-streaming mode
    */
@@ -74,50 +132,9 @@ export class ClaudeWorker extends EventEmitter {
       this.proc.kill()
     }
 
-    // Note: We use --output-format json (not stream-json) for simpler parsing
-    //
-    // Security: tool access and permission bypass are OPT-IN, not the default.
-    //   CLAUDE_TOOLS  -> value passed to `--tools` ("" disables ALL tools, the
-    //                    safe default; "default" enables all; or a list like
-    //                    "Read,Edit"). With tools disabled the worker can only
-    //                    generate text, removing the RCE surface for an exposed
-    //                    HTTP endpoint.
-    //   CLAUDE_SKIP_PERMISSIONS=true -> restores the old
-    //                    `--dangerously-skip-permissions` behaviour. Only
-    //                    meaningful when tools are enabled. Never enable this on
-    //                    an endpoint reachable by untrusted clients.
-    //
-    // NOTE: `--tools` is variadic, so it must be followed by another flag and
-    // never sit immediately before the prompt, or it swallows the prompt as a
-    // tool name. The prompt is always passed LAST as the lone positional arg.
-    const toolsSetting = process.env.CLAUDE_TOOLS ?? ''
-    const skipPermissions = process.env.CLAUDE_SKIP_PERMISSIONS === 'true'
-
-    const args = [
-      '-p',
-      '--tools',
-      toolsSetting,
-      '--output-format',
-      'json',
-      '--session-id',
-      this.conversationId
-    ]
-    const resolvedModel = resolveModel(model)
-    if (resolvedModel) {
-      args.push('--model', resolvedModel)
-    }
-    if (skipPermissions) {
-      args.push('--dangerously-skip-permissions')
-    }
-    args.push(prompt) // prompt MUST be the final argument
-
-    // Use OAuth mode (global claude) or API key mode (local installation)
-    const command = USE_OAUTH
-      ? process.platform === 'win32'
-        ? 'claude.cmd'
-        : 'claude'
-      : 'node'
-    const finalArgs = USE_OAUTH ? args : [CLAUDE_CLI_PATH, ...args]
+    // Non-streaming: one JSON object on stdout (parsed in handleJsonOutput).
+    const args = this.buildClaudeArgs(prompt, model, { stream: false })
+    const { command, finalArgs } = this.resolveSpawnCommand(args)
 
     console.log(
       `[Worker ${this.conversationId}] ${
@@ -318,70 +335,115 @@ export class ClaudeWorker extends EventEmitter {
   }
 
   /**
-   * Send a message with streaming callback
+   * Send a message and stream the response.
+   *
+   * Spawns a dedicated `claude -p --output-format stream-json` process for this
+   * request, parses the NDJSON events, and invokes onChunk() with OpenAI
+   * chat.completion.chunk objects: a role chunk, one per text delta, then a
+   * final chunk carrying finish_reason. Resolves when the process exits.
    */
   async sendStreaming (messages, model, onChunk) {
-    if (!this.proc || !this.ready) {
-      await this.spawn()
-    }
-
     this.lastUsed = Date.now()
 
-    const claudeInput = openaiToClaudeInput(messages, this.conversationId)
-    const requestId = claudeInput.uuid
-    const completionId = `chatcmpl-${uuidv4().slice(0, 8)}`
+    // Build prompt from messages (same convention as send())
+    let prompt = ''
+    for (const msg of messages) {
+      if (msg.role === 'system') {
+        prompt += `System: ${msg.content}\n\n`
+      } else if (msg.role === 'user') {
+        prompt += msg.content
+      }
+    }
 
-    // Send initial role chunk
+    const completionId = `chatcmpl-${uuidv4().slice(0, 8)}`
+    const args = this.buildClaudeArgs(prompt, model, { stream: true })
+    const { command, finalArgs } = this.resolveSpawnCommand(args)
+
+    console.log(
+      `[Worker ${this.conversationId}] ${
+        USE_OAUTH ? 'OAuth' : 'API Key'
+      } stream: ${command} -p "${prompt.substring(0, 30)}..."`
+    )
+
+    if (this.proc && this.proc.exitCode === null) {
+      this.proc.kill()
+    }
+
+    // Initial role chunk
     onChunk(claudeToOpenaiChunk({ type: 'message_start' }, completionId, model))
 
     return new Promise((resolve, reject) => {
-      const pending = {
-        resolve,
-        reject,
-        chunks: [],
-        resultEvent: null
-      }
+      const proc = spawn(command, finalArgs, {
+        cwd: this.workspaceDir,
+        env: { ...process.env, TERM: 'dumb', NO_COLOR: '1' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+        shell: USE_OAUTH && process.platform === 'win32',
+        windowsHide: true
+      })
+      this.proc = proc
+      this.ready = true
 
-      this.pendingRequests.set(requestId, pending)
+      const rl = createInterface({ input: proc.stdout })
+      let sawContent = false
+      let finished = false
 
-      // Listen for chunks specific to this request
-      const chunkHandler = ({ requestId: chunkReqId, event }) => {
-        if (chunkReqId === requestId) {
-          const openaiChunk = claudeToOpenaiChunk(event, completionId, model)
-          if (
-            openaiChunk.choices[0].delta.content ||
-            openaiChunk.choices[0].finish_reason
-          ) {
-            onChunk(openaiChunk)
-          }
-        }
-      }
-
-      this.on('chunk', chunkHandler)
-
-      // Modify resolve to clean up listener
-      const originalResolve = pending.resolve
-      pending.resolve = result => {
-        this.off('chunk', chunkHandler)
-
-        // Send final chunk with finish_reason
+      const finish = () => {
+        if (finished) return
+        finished = true
         onChunk(claudeToOpenaiChunk({ type: 'result' }, completionId, model))
-
-        originalResolve(result)
       }
 
-      pending.reject = err => {
-        this.off('chunk', chunkHandler)
+      rl.on('line', line => {
+        const parsed = parseClaudeLine(line)
+        if (!parsed) return
+
+        if (
+          parsed.type === 'stream_event' &&
+          parsed.event?.type === 'content_block_delta' &&
+          parsed.event.delta?.type === 'text_delta' &&
+          parsed.event.delta.text
+        ) {
+          sawContent = true
+          onChunk(claudeToOpenaiChunk(parsed, completionId, model))
+        } else if (parsed.type === 'result') {
+          // Fallback: if partial deltas were unavailable, emit the full text.
+          if (!sawContent && parsed.result) {
+            const chunk = claudeToOpenaiChunk(
+              { type: 'message_start' },
+              completionId,
+              model
+            )
+            chunk.choices[0].delta = { content: parsed.result }
+            onChunk(chunk)
+          }
+          finish()
+        }
+      })
+
+      proc.stderr.on('data', data => {
+        const msg = data.toString().trim()
+        if (msg) {
+          console.error(`[Worker ${this.conversationId}] stderr: ${msg}`)
+        }
+      })
+
+      proc.on('error', err => {
+        this.proc = null
+        this.ready = false
         reject(err)
-      }
+      })
 
-      // Send the message
-      const inputLine = JSON.stringify(claudeInput) + '\n'
-      this.proc.stdin.write(inputLine, err => {
-        if (err) {
-          this.off('chunk', chunkHandler)
-          this.pendingRequests.delete(requestId)
-          reject(err)
+      proc.on('close', code => {
+        this.proc = null
+        this.ready = false
+        rl.close()
+        finish() // ensure a finish_reason chunk even if no result line was seen
+        if (code === 0 || sawContent) {
+          resolve({ chunks: [], result: null })
+        } else {
+          reject(
+            new Error(`Worker process exited with code ${code} before completing`)
+          )
         }
       })
     })
