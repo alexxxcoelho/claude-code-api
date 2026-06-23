@@ -181,7 +181,14 @@ function getConversationId (req) {
  */
 app.post('/v1/chat/completions', async (req, res) => {
   try {
-    const { messages, model = 'claude-code', stream = false } = req.body
+    const {
+      messages,
+      model = 'claude-code',
+      stream = false,
+      tools,
+      tool_choice: toolChoice
+    } = req.body
+    const opts = { tools, toolChoice }
 
     // Validate request
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
@@ -210,7 +217,8 @@ app.post('/v1/chat/completions', async (req, res) => {
         for await (const chunk of pool.chatCompletionStream(
           conversationId,
           messages,
-          model
+          model,
+          opts
         )) {
           res.write(chunk)
         }
@@ -228,7 +236,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       const response = await pool.chatCompletion(
         conversationId,
         messages,
-        model
+        model,
+        opts
       )
       res.setHeader('X-Conversation-ID', conversationId)
       res.json(response)

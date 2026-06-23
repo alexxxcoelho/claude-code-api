@@ -139,13 +139,15 @@ export class HybridPool {
   /**
    * Handle a chat completion request (non-streaming)
    */
-  async chatCompletion (conversationId, messages, model) {
+  async chatCompletion (conversationId, messages, model, opts = {}) {
     const worker = await this.getOrCreateWorker(conversationId)
     const completionId = `chatcmpl-${uuidv4().slice(0, 8)}`
 
     try {
-      const { chunks, result } = await worker.send(messages, model)
-      return claudeResultToOpenai(result, chunks, completionId, model)
+      const { chunks, result } = await worker.send(messages, model, opts)
+      return claudeResultToOpenai(result, chunks, completionId, model, {
+        tools: opts.tools
+      })
     } catch (err) {
       console.error(`[Pool] Error in chat completion:`, err)
       throw err
@@ -156,7 +158,7 @@ export class HybridPool {
    * Handle a streaming chat completion request
    * Returns an async generator of SSE strings
    */
-  async *chatCompletionStream (conversationId, messages, model) {
+  async *chatCompletionStream (conversationId, messages, model, opts = {}) {
     const worker = await this.getOrCreateWorker(conversationId)
     const completionId = `chatcmpl-${uuidv4().slice(0, 8)}`
 
@@ -167,9 +169,14 @@ export class HybridPool {
 
     // Start the request
     const requestPromise = worker
-      .sendStreaming(messages, model, chunk => {
-        chunks.push(chunk)
-      })
+      .sendStreaming(
+        messages,
+        model,
+        chunk => {
+          chunks.push(chunk)
+        },
+        opts
+      )
       .then(() => {
         done = true
       })

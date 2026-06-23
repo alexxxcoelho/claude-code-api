@@ -5,10 +5,11 @@ import { v4 as uuidv4 } from 'uuid'
 import { fileURLToPath } from 'url'
 import { dirname, join } from 'path'
 import {
-  openaiToClaudeInput,
   claudeToOpenaiChunk,
   claudeResultToOpenai,
-  parseClaudeLine
+  parseClaudeLine,
+  toolsToSystemPrompt,
+  parseAssistantToolCalls
 } from './translator.js'
 
 const __filename = fileURLToPath(import.meta.url)
@@ -88,14 +89,32 @@ export function messagesToPrompt (messages) {
     .filter(Boolean)
     .join('\n\n')
 
-  const convo = messages.filter(m => m.role === 'user' || m.role === 'assistant')
+  const convo = messages.filter(
+    m => m.role === 'user' || m.role === 'assistant' || m.role === 'tool'
+  )
+
+  const render = m => {
+    if (m.role === 'assistant') {
+      const text = extractText(m.content)
+      if (Array.isArray(m.tool_calls) && m.tool_calls.length) {
+        const calls = m.tool_calls
+          .map(tc => `${tc.function?.name}(${tc.function?.arguments})`)
+          .join(', ')
+        return `Assistant: ${text ? text + ' ' : ''}[called: ${calls}]`
+      }
+      return `Assistant: ${text}`
+    }
+    if (m.role === 'tool') {
+      return `Tool result (${m.tool_call_id || ''}): ${extractText(m.content)}`
+    }
+    return `Human: ${extractText(m.content)}`
+  }
+
   let prompt
   if (convo.length <= 1) {
     prompt = convo.length ? extractText(convo[0].content) : ''
   } else {
-    prompt = convo
-      .map(m => `${m.role === 'assistant' ? 'Assistant' : 'Human'}: ${extractText(m.content)}`)
-      .join('\n\n')
+    prompt = convo.map(render).join('\n\n')
   }
   return { systemPrompt, prompt }
 }
@@ -363,10 +382,12 @@ export class ClaudeWorker extends EventEmitter {
    * Send a message and get the response
    * Note: In non-streaming JSON mode, we spawn a new process for each request
    */
-  async send (messages, model = 'claude-code') {
+  async send (messages, model = 'claude-code', opts = {}) {
     this.lastUsed = Date.now()
 
     const { systemPrompt, prompt } = messagesToPrompt(messages)
+    const fullSystem =
+      systemPrompt + toolsToSystemPrompt(opts.tools, opts.toolChoice)
     const requestId = uuidv4()
 
     return new Promise((resolve, reject) => {
@@ -378,38 +399,57 @@ export class ClaudeWorker extends EventEmitter {
       })
 
       // Spawn new process with the prompt + requested model + system prompt
-      this.spawn(prompt, model, systemPrompt).catch(reject)
+      this.spawn(prompt, model, fullSystem).catch(reject)
     })
   }
 
   /**
    * Send a message and stream the response.
    *
-   * Spawns a dedicated `claude -p --output-format stream-json` process for this
-   * request, parses the NDJSON events, and invokes onChunk() with OpenAI
-   * chat.completion.chunk objects: a role chunk, one per text delta, then a
-   * final chunk carrying finish_reason. Resolves when the process exits.
+   * Spawns a dedicated `claude -p --output-format stream-json` process, parses
+   * the NDJSON, and invokes onChunk() with OpenAI chat.completion.chunk objects:
+   * a role chunk, content deltas, then a finish_reason chunk.
+   *
+   * When opts.tools is set, output is buffered (not streamed) so a tool-call
+   * envelope can be detected and emitted as a tool_calls delta with
+   * finish_reason 'tool_calls'; otherwise text deltas stream as they arrive.
    */
-  async sendStreaming (messages, model, onChunk) {
+  async sendStreaming (messages, model, onChunk, opts = {}) {
     this.lastUsed = Date.now()
 
     const { systemPrompt, prompt } = messagesToPrompt(messages)
+    const toolText = toolsToSystemPrompt(opts.tools, opts.toolChoice)
+    const hasTools = toolText.length > 0
+    const fullSystem = systemPrompt + toolText
     const completionId = `chatcmpl-${uuidv4().slice(0, 8)}`
-    const args = this.buildClaudeArgs(prompt, model, { stream: true, systemPrompt })
+    const args = this.buildClaudeArgs(prompt, model, {
+      stream: true,
+      systemPrompt: fullSystem
+    })
     const { command, finalArgs } = this.resolveSpawnCommand(args)
 
     console.log(
-      `[Worker ${this.conversationId}] ${
-        USE_OAUTH ? 'OAuth' : 'API Key'
-      } stream: ${command} -p "${prompt.substring(0, 30)}..."`
+      `[Worker ${this.conversationId}] ${USE_OAUTH ? 'OAuth' : 'API Key'} stream${
+        hasTools ? '+tools' : ''
+      }: ${command} -p "${prompt.substring(0, 30)}..."`
     )
 
     if (this.proc && this.proc.exitCode === null) {
       this.proc.kill()
     }
 
+    const baseChunk = () => ({
+      id: completionId,
+      object: 'chat.completion.chunk',
+      created: Math.floor(Date.now() / 1000),
+      model,
+      choices: [{ index: 0, delta: {}, finish_reason: null }]
+    })
+
     // Initial role chunk
-    onChunk(claudeToOpenaiChunk({ type: 'message_start' }, completionId, model))
+    const roleChunk = baseChunk()
+    roleChunk.choices[0].delta = { role: 'assistant' }
+    onChunk(roleChunk)
 
     return new Promise((resolve, reject) => {
       const proc = spawn(command, finalArgs, {
@@ -423,13 +463,33 @@ export class ClaudeWorker extends EventEmitter {
       this.ready = true
 
       const rl = createInterface({ input: proc.stdout })
-      let sawContent = false
+      let buffered = ''
+      let sawResult = false
       let finished = false
 
-      const finish = () => {
+      const emitContent = text => {
+        const c = baseChunk()
+        c.choices[0].delta = { content: text }
+        onChunk(c)
+      }
+      const emitToolCalls = calls => {
+        const c = baseChunk()
+        c.choices[0].delta = {
+          tool_calls: calls.map((tc, i) => ({
+            index: i,
+            id: tc.id,
+            type: 'function',
+            function: { name: tc.function.name, arguments: tc.function.arguments }
+          }))
+        }
+        onChunk(c)
+      }
+      const finishWith = reason => {
         if (finished) return
         finished = true
-        onChunk(claudeToOpenaiChunk({ type: 'result' }, completionId, model))
+        const c = baseChunk()
+        c.choices[0].finish_reason = reason
+        onChunk(c)
       }
 
       rl.on('line', line => {
@@ -442,20 +502,24 @@ export class ClaudeWorker extends EventEmitter {
           parsed.event.delta?.type === 'text_delta' &&
           parsed.event.delta.text
         ) {
-          sawContent = true
-          onChunk(claudeToOpenaiChunk(parsed, completionId, model))
+          buffered += parsed.event.delta.text
+          if (!hasTools) emitContent(parsed.event.delta.text)
         } else if (parsed.type === 'result') {
-          // Fallback: if partial deltas were unavailable, emit the full text.
-          if (!sawContent && parsed.result) {
-            const chunk = claudeToOpenaiChunk(
-              { type: 'message_start' },
-              completionId,
-              model
-            )
-            chunk.choices[0].delta = { content: parsed.result }
-            onChunk(chunk)
+          sawResult = true
+          const text = buffered || parsed.result || ''
+          if (hasTools) {
+            const toolCalls = parseAssistantToolCalls(text)
+            if (toolCalls) {
+              emitToolCalls(toolCalls)
+              finishWith('tool_calls')
+            } else {
+              if (text) emitContent(text)
+              finishWith('stop')
+            }
+          } else {
+            if (!buffered && parsed.result) emitContent(parsed.result)
+            finishWith('stop')
           }
-          finish()
         }
       })
 
@@ -476,8 +540,8 @@ export class ClaudeWorker extends EventEmitter {
         this.proc = null
         this.ready = false
         rl.close()
-        finish() // ensure a finish_reason chunk even if no result line was seen
-        if (code === 0 || sawContent) {
+        finishWith('stop') // safety net to always close the SSE stream
+        if (code === 0 || sawResult) {
           resolve({ chunks: [], result: null })
         } else {
           reject(
